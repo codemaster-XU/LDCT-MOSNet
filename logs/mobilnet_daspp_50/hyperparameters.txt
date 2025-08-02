@@ -1,0 +1,32 @@
+Cuda: True
+seed: 11
+distributed: False
+sync_bn: False
+fp16: False
+num_classes: 11
+backbone: mobilenet
+pretrained: True
+model_path: model_data/deeplab_mobilenetv2_DENSE.pth
+downsample_factor: 16
+input_shape: [512, 512]
+Init_Epoch: 0
+Freeze_Epoch: 25
+UnFreeze_Epoch: 50
+Freeze_batch_size: 8
+Unfreeze_batch_size: 4
+Freeze_Train: False
+Init_lr: 0.0007
+Min_lr: 7e-06
+optimizer_type: adam
+momentum: 0.9
+weight_decay: 0
+lr_decay_type: cos
+save_period: 5
+save_dir: logs
+eval_flag: True
+eval_period: 5
+VOCdevkit_path: VOCdevkit
+dice_loss: True
+focal_loss: False
+cls_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+num_workers: 4
