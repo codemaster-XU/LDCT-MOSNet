@@ -17,7 +17,7 @@ LDCT-MOSnet在独立外部数据集LIDC-IDRI（肺癌分割）与TCIA（肺结�
 - MMulti-Scale Hierarchical Feature Reuse​​-DeeplabV3
 - Composite Loss Function with Dynamic Edge Awareness and Multi-Scale Confidence Weighting​-DeeplabV3
 
-比较
+比较（本文的所有对比试验都是github上的代码）
 - AgileFormer
 - mmcv
 - nnUNet
