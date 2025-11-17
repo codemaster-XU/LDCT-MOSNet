@@ -6,6 +6,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from nets.deeplabv3_plus_DenseAspp import DeepLab
 from nets.deeplabv3_training import (get_lr_scheduler, set_optimizer_lr,
@@ -411,70 +412,161 @@ class CustomDataset(Dataset):
         
         return image, mask
 
-# 定义对称交叉熵损失函数
-class SymmetricCrossEntropyLoss(torch.nn.Module):
-    def __init__(self, alpha=0.1, reduction='mean'):
-        super(SymmetricCrossEntropyLoss, self).__init__()
-        self.alpha = alpha
-        self.reduction = reduction
-        
-    def forward(self, pred, target):
-        # 标准交叉熵损失
-        ce = torch.nn.functional.cross_entropy(pred, target, reduction='none')
-        
-        # 预测的概率分布
-        pred_prob = torch.softmax(pred, dim=1)
-        
-        # 反向交叉熵损失
-        reverse_ce = -torch.sum(pred_prob * torch.log(pred_prob + 1e-12), dim=1)
-        
-        # 对称交叉熵损失
-        sce = ce + self.alpha * reverse_ce
-        
-        if self.reduction == 'mean':
-            return torch.mean(sce)
-        elif self.reduction == 'sum':
-            return torch.sum(sce)
-        else:
-            return sce
 
-# 定义边界损失函数
-class BoundaryLoss(torch.nn.Module):
-    def __init__(self, pixel_spacing=1.0):
-        super(BoundaryLoss, self).__init__()
-        self.pixel_spacing = pixel_spacing
-        
-    def forward(self, pred, target):
-        # 转换为二值掩码（前景为1，背景为0）
-        binary_target = (target > 0).float()
-        
-        # 在CPU上计算距离变换图（每个像素到最近边界点的距离）
+class AreaWeightedDiceLoss(torch.nn.Module):
+    """
+    论文式 Area-Weighted Dice 损失，对应 L_Dice（公式 5）
+    ω_c = 1 / (Area_c + eps)^2
+    L_Dice = 1 - 2 * sum_c ω_c * sum_i p_c(i) g_c(i) / sum_c ω_c * sum_i [p_c(i)+g_c(i)]
+    """
+    def __init__(self, num_classes, eps: float = 1e-6):
+        super(AreaWeightedDiceLoss, self).__init__()
+        self.num_classes = num_classes
+        self.eps = eps
+
+    def forward(self, logits, target):
+        # logits: [N, C, H, W], target: [N, H, W]
+        n, c, h, w = logits.shape
+        probs = torch.softmax(logits, dim=1)
+
+        # one-hot 标签 [N, C, H, W]
+        target_one_hot = torch.nn.functional.one_hot(
+            target.clamp(min=0, max=self.num_classes - 1),
+            num_classes=c
+        ).permute(0, 3, 1, 2).float()
+
+        # 当前 batch 内的类别面积比例 Area_c
+        area = target_one_hot.view(n, c, -1).sum(dim=(0, 2)) / float(n * h * w)
+        # 避免 0 面积类别权重爆炸，做一个下界
+        area = torch.clamp(area, min=self.eps)
+        weights = 1.0 / (area + self.eps) ** 2
+        # 归一化到均值约为 1，避免数值过大
+        weights = weights * (c / (weights.sum() + self.eps))
+
+        probs_flat = probs.view(n, c, -1)
+        target_flat = target_one_hot.view(n, c, -1)
+
+        intersection = (probs_flat * target_flat).sum(dim=(0, 2))
+        summation = (probs_flat + target_flat).sum(dim=(0, 2))
+
+        numerator = 2.0 * (weights * intersection).sum()
+        denominator = (weights * summation).sum() + self.eps
+        dice = numerator / denominator
+        return 1.0 - dice
+
+
+class DynamicBoundaryInsensitiveLoss(torch.nn.Module):
+    """
+    动态边界不敏感损失 L_DBI（公式 6）:
+    L_DBI = - Σ_{i∈M_err} log(1 - p_i) * exp(k * d_i)
+    其中 d_i 为到 GT 边界的欧氏距离，M_err 为误分像素集合。
+    """
+    def __init__(self, pixel_spacing: float = 1.0, k: float = 0.3, eps: float = 1e-6):
+        super(DynamicBoundaryInsensitiveLoss, self).__init__()
+        self.pixel_spacing = float(pixel_spacing)
+        self.k = float(k)
+        self.eps = eps
+
+    def forward(self, logits, target):
+        # logits: [N, C, H, W], target: [N, H, W]
+        device = logits.device
+        n, c, h, w = logits.shape
+
         with torch.no_grad():
-            # 距离变换图（边界内部为负值，外部为正值）
-            dist_map = np.zeros_like(binary_target.cpu().numpy())
-            for i in range(dist_map.shape[0]):
-                for j in range(dist_map.shape[1]):
-                    # 二值分割图
-                    bin_img = binary_target[i, j].cpu().numpy()
-                    
-                    # 计算边界距离
-                    outer = distance_transform_edt(1 - bin_img) * self.pixel_spacing
-                    inner = distance_transform_edt(bin_img) * self.pixel_spacing
-                    
-                    # 创建有向距离图（外部为正，内部为负）
-                    dist_map[i, j] = outer - inner
-        
-        # 转换为张量并移到GPU
-        dist_map = torch.tensor(dist_map, dtype=torch.float32).to(pred.device)
-        
-        # 计算前景概率
-        pred_prob = torch.softmax(pred, dim=1)
-        foreground_prob = 1 - pred_prob[:, 0]  # 背景的概率减去1即前景概率
-        
-        # 边界损失（按原论文系数）
-        boundary_loss = torch.mean(foreground_prob * dist_map)
-        
-        return boundary_loss
+            # 只考虑前景 / 背景边界：label > 0 视为前景
+            gt_binary = (target > 0).cpu().numpy().astype(np.uint8)  # [N, H, W]
+            dist_map = np.zeros_like(gt_binary, dtype=np.float32)
+            for b in range(n):
+                bin_img = gt_binary[b]
+                if bin_img.max() == 0:
+                    # 没有前景，距离全 0
+                    continue
+                # 前景内部和背景内部到边界的距离
+                dist_in = distance_transform_edt(bin_img)
+                dist_out = distance_transform_edt(1 - bin_img)
+                dist = np.minimum(dist_in, dist_out) * self.pixel_spacing
+                dist_map[b] = dist
+            dist_map = torch.from_numpy(dist_map).to(device=device, dtype=torch.float32)
+
+        probs = torch.softmax(logits, dim=1)
+        p_max, pred_labels = probs.max(dim=1)  # [N, H, W]
+
+        # 误分像素集合 M_err
+        Merr = (pred_labels != target).to(device)
+        if Merr.sum() == 0:
+            return logits.new_tensor(0.0)
+
+        p_err = p_max[Merr]                      # 误分处预测类别的概率 p_i
+        d_err = dist_map[Merr]                   # 对应的距离 d_i
+
+        loss = -torch.mean(torch.log(1.0 - p_err + self.eps) * torch.exp(self.k * d_err))
+        return loss
+
+
+class MultiScaleConfidenceWeightedLoss(torch.nn.Module):
+    """
+    多尺度置信度加权损失 L_MSCW（公式 7）:
+    conf_s = Dice(P_s, G), conf_m = Dice(P_m, G), conf_d = Dice(P_d, G)
+    L_MSCW = - Σ_i (α conf_s g_i log P_s(i) + β conf_m g_i log P_m(i) + γ conf_d g_i log P_d(i))
+
+    这里用同一输出 logits 在三个尺度上插值得到 P_s/P_m/P_d，以近似论文的多尺度预测。
+    """
+    def __init__(self, num_classes, alpha=0.4, beta=0.3, gamma=0.3, eps: float = 1e-6):
+        super(MultiScaleConfidenceWeightedLoss, self).__init__()
+        self.num_classes = num_classes
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.eps = eps
+
+    def _dice_from_probs(self, probs, target):
+        """
+        使用概率图与 one-hot GT 计算全局 Dice 作为置信度 conf_*。
+        probs: [N, C, H, W], target: [N, H, W]
+        """
+        n, c, h, w = probs.shape
+        target_one_hot = torch.nn.functional.one_hot(
+            target.clamp(min=0, max=self.num_classes - 1),
+            num_classes=c
+        ).permute(0, 3, 1, 2).float()
+        intersection = (probs * target_one_hot).sum()
+        union = probs.sum() + target_one_hot.sum()
+        dice = (2.0 * intersection + self.eps) / (union + self.eps)
+        return dice
+
+    def _scale_logits_and_target(self, logits, target, scale):
+        if scale == 1.0:
+            return logits, target
+        n, c, h, w = logits.shape
+        new_h = max(1, int(h * scale))
+        new_w = max(1, int(w * scale))
+        scaled_logits = F.interpolate(logits, size=(new_h, new_w), mode="bilinear", align_corners=True)
+        # 目标用最近邻插值保持离散标签
+        scaled_target = F.interpolate(
+            target.unsqueeze(1).float(), size=(new_h, new_w), mode="nearest"
+        ).squeeze(1).long()
+        return scaled_logits, scaled_target
+
+    def forward(self, logits, target):
+        """
+        logits: [N, C, H, W], target: [N, H, W]
+        """
+        total_loss = logits.new_tensor(0.0)
+
+        # 三个尺度：浅（1/4）、中（1/2）、深（1.0）
+        scales = [0.25, 0.5, 1.0]
+        weights = [self.alpha, self.beta, self.gamma]
+
+        for scale, w in zip(scales, weights):
+            if w == 0:
+                continue
+            scaled_logits, scaled_target = self._scale_logits_and_target(logits, target, scale)
+            probs = torch.softmax(scaled_logits, dim=1)
+            conf = self._dice_from_probs(probs, scaled_target)
+            ce = torch.nn.functional.cross_entropy(scaled_logits, scaled_target)
+            total_loss = total_loss + w * conf * ce
+
+        return total_loss
 
 # 自定义的fit_one_epoch函数
 def custom_fit_one_epoch(model_train, model, loss_history, eval_callback, optimizer, epoch, epoch_step, epoch_step_val, 
@@ -483,9 +575,13 @@ def custom_fit_one_epoch(model_train, model, loss_history, eval_callback, optimi
     total_loss = 0
     val_loss = 0
     
-    # 创建损失函数实例（根据论文设置权重）
-    sce_loss = SymmetricCrossEntropyLoss(alpha=0.1)
-    boundary_loss = BoundaryLoss()
+    # 按论文 LDCT-loss 定义创建三个损失分量
+    # L = L_Dice + λ_b * L_DBI + λ_c * L_MSCW
+    lambda_b = 0.8
+    lambda_c = 0.5
+    ldice_loss = AreaWeightedDiceLoss(num_classes=num_classes)
+    dbi_loss = DynamicBoundaryInsensitiveLoss(pixel_spacing=1.0, k=0.3)
+    mscw_loss = MultiScaleConfidenceWeightedLoss(num_classes=num_classes, alpha=0.4, beta=0.3, gamma=0.3)
     
     model_train.train()
     
@@ -503,12 +599,14 @@ def custom_fit_one_epoch(model_train, model, loss_history, eval_callback, optimi
         # 前向传播
         outputs = model_train(images)
         
-        # 计算损失 - 使用对称交叉熵损失和边界损失
-        sce = sce_loss(outputs, masks.squeeze(1))
-        bd = boundary_loss(outputs, masks.squeeze(1))
-        
-        # 按论文比例组合损失
-        loss = 0.6 * sce + 0.4 * bd
+        # 论文 LDCT-loss 组合：L = L_Dice + λ_b * L_DBI + λ_c * L_MSCW
+        logits = outputs
+        # 标签为 [N, H, W]
+        targets = masks.squeeze(1)
+        l_dice = ldice_loss(logits, targets)
+        l_dbi = dbi_loss(logits, targets)
+        l_mscw = mscw_loss(logits, targets)
+        loss = l_dice + lambda_b * l_dbi + lambda_c * l_mscw
         
         # 反向传播
         loss.backward()
@@ -530,9 +628,12 @@ def custom_fit_one_epoch(model_train, model, loss_history, eval_callback, optimi
             masks = masks.to(cuda).long()     # 转换为long (int64)
             
             outputs = model_train(images)
-            sce = sce_loss(outputs, masks.squeeze(1))
-            bd = boundary_loss(outputs, masks.squeeze(1))
-            loss = 0.6 * sce + 0.4 * bd
+            logits = outputs
+            targets = masks.squeeze(1)
+            l_dice = ldice_loss(logits, targets)
+            l_dbi = dbi_loss(logits, targets)
+            l_mscw = mscw_loss(logits, targets)
+            loss = l_dice + lambda_b * l_dbi + lambda_c * l_mscw
             val_loss += loss.item()
     
     # 计算平均损失
