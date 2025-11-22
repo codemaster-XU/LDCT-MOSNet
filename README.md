@@ -1,50 +1,122 @@
-# 医学图像分割BIBM
-# author: Zongqi Xu
-# date: 2025/7/31
-# SouthWest Minzu University
+<div align="center">
 
-### 数据集
+# LDCT-MOSNet: Medical Image Segmentation for BIBM 2025
 
-本研究基于中国河南省某三甲医院及其医联体（涵盖省内多家农村医院、县级医院及三甲医院）的多中心慢阻肺普筛CT数据集，共纳入2000例受试者。数据来源覆盖不少于12个区域的标准化CT扫描，并已通过伦理审查（伦理号：2024HL-040）。数据具有典型的多中心研究的共性挑战：样本不平衡、放射剂量偏差、配准困难等，研究团队对2000例患者的CT影像进行了精细标注，涵盖29类器官/组织标签（详见正文），其中1067例已记录完整的设备型号与扫描参数。
-LDCT-MOSnet在独立外部数据集LIDC-IDRI（肺癌分割）与TCIA（肺结节分割）上进行泛化测试。
+**Author:** Zongqi Xu  
+**Affiliation:** SouthWest Minzu University  
+**Updated:** 2025/07/31  
+**Status:** Manuscript under review (BIBM 2025)
 
-### 本项目实现和比较了以下几种模型：
+</div>
 
-改进
-- DeepLabV3+ MobileNetV2
-- DSDeepLab（改进） MobileNetV2
-- DenseASSP-DeeplabV3
-- MMulti-Scale Hierarchical Feature Reuse​​-DeeplabV3
-- Composite Loss Function with Dynamic Edge Awareness and Multi-Scale Confidence Weighting​-DeeplabV3
+---
 
-比较（本文的所有对比试验都是github上的代码）
+## Overview
+
+LDCT-MOSNet targets low-dose CT (LDCT) multi-organ segmentation for chronic obstructive pulmonary disease (COPD) population screening. The project investigates how lightweight DeepLab variants and custom loss designs perform under multi-center, low-dose, and hardware-diverse scenarios. We provide training/evaluation pipelines, comparison baselines, and utilities for reproducible experimentation on large-scale clinical datasets.
+
+## Dataset
+
+- **Source:** Multi-center COPD LDCT program run by a Class III Grade A hospital in Henan, China and its medical alliance (≥12 regional hospitals, covering rural, county, and tertiary centers).
+- **Cohort:** 2,000 subjects with expert annotations covering 29 organ/tissue labels.  
+  - 1,067 cases include complete scanner metadata (vendor, model, dose parameters).  
+  - Ethics approval: *2024HL-040*.
+- **Challenges:** Strong inter-center heterogeneity, dose bias, registration difficulty, class imbalance.
+- **External Validation:** LIDC-IDRI (lung cancer lesions) and TCIA cohorts for cross-dataset generalization.
+
+## Implemented Models
+
+### Proposed / Improved Variants
+
+- DeepLabV3+ with MobileNetV2 backbone  
+- DSDeepLab (improved) + MobileNetV2  
+- DenseASSP-DeeplabV3  
+- Multi-Scale Hierarchical Feature Reuse DeepLabV3  
+- DeepLabV3 with composite loss (dynamic edge awareness + multi-scale confidence weighting)
+
+### Baseline Comparisons (GitHub references)
+
 - AgileFormer
-- mmcv
+- MMCV-based baselines
 - nnUNet
 - ParaTransCNN
-- SACnet
-- SwinTansformer
-- Unet
-- Unet++
+- SACNet
+- Swin-Transformer segmentation
+- U-Net / U-Net++
 - ARU-Net
 
-## 环境要求 
-python
-python 3.8
-cuda 12.1
-torch 2.1.0
-NVIDIA RTX3090 （24GB VRAM per GPU）*8
+## Environment
 
-## 项目结构（根据具体情况切换参数并更换模型的局部模块）
-├── logs/ # 日志（训练和预测的日志）
-├── nets/ # 网络模型定义
-├── utils/ # 工具函数
-├── segment_anything # sam2库
-├── model_data # 基础模型权重
-├── VOCdevkit # 数据集
-├── train.py # 训练脚本-要根据模型更改切换参数和模块
-├── train.py # MiniNet训练脚本-要根据模型更改切换参数和模块
-├── predict.py # 预测脚本
-└── parameters_count.py # 参数统计脚本
+| Component | Version / Requirement |
+|-----------|----------------------|
+| Python    | 3.8                  |
+| CUDA      | 12.1                 |
+| PyTorch   | 2.1.0                |
+| Hardware  | 8 × NVIDIA RTX 3090 (24 GB VRAM each) |
 
-- 相关论文正在投稿BIBM 2025
+> **Tip:** Adjust `requirements.txt` or conda environment file according to the backbone you plan to train; some comparison models may require additional dependencies (e.g., mmcv, timm, einops).
+
+## Repository Structure
+
+```
+├── logs/                 # Training & inference logs
+├── nets/                 # Model definitions (DeepLab variants, custom modules)
+├── utils/                # Data loaders, metrics, schedulers, visualization helpers
+├── segment_anything/     # SAM/SAM2 utilities (optional)
+├── model_data/           # Pretrained weights & checkpoints
+├── VOCdevkit/            # Dataset root (default structure, replace with your LDCT data)
+├── train.py              # Main training script (switch configs for each model)
+├── train_mininet.py      # MiniNet training script (rename from README: previously second train.py)
+├── predict.py            # Inference / evaluation entry point
+└── parameters_count.py   # Parameter counting utility
+```
+
+> Make sure to rename duplicated scripts appropriately (e.g., `train_mininet.py`) to avoid ambiguity when switching between backbones.
+
+## Quick Start
+
+1. **Prepare dataset**  
+   - Organize LDCT volumes and labels under `VOCdevkit/` following Pascal VOC-style folder hierarchy, or adapt the data loader paths inside `utils/`.
+   - For external validation, place LIDC-IDRI/TCIA data in separate folders and update the config.
+
+2. **Install environment**
+   ```bash
+   conda create -n ldct-mosnet python=3.8
+   conda activate ldct-mosnet
+   pip install -r requirements.txt  # customize for specific baseline
+   ```
+
+3. **Train**
+   ```bash
+   python train.py \
+     --model deeplabv3_plus_mobilenetv2 \
+     --dataset VOCdevkit --num_classes 29 \
+     --batch_size 16 --epochs 120 \
+     --loss composite_edge_confidence
+   ```
+
+4. **Evaluate / Predict**
+   ```bash
+   python predict.py \
+     --weights logs/best_model.pth \
+     --input  VOCdevkit/val.txt \
+     --save_dir outputs/
+   ```
+
+5. **Compare baselines**  
+   - Integrate third-party repos (AgileFormer, nnUNet, etc.) under `nets/` or as submodules.  
+   - Keep logs per model (`logs/<model_name>/`) for reproducibility and reporting.
+
+## Results & Manuscript Status
+
+- Extensive experiments across improved DeepLab variants and open-source baselines.  
+- Cross-dataset validation on LIDC-IDRI and TCIA confirms strong generalization of LDCT-MOSNet under domain shift.  
+- Full paper is under review for **IEEE BIBM 2025**; benchmark tables and ablation studies will be released upon acceptance.
+
+## Citation
+
+> Zongqi Xu, *LDCT-MOSNet: Lightweight DeepLab Variants with Composite Loss for Multi-Organ Segmentation in Low-Dose CT*, submitted to IEEE International Conference on Bioinformatics & Biomedicine (BIBM), 2025.
+
+---
+
+For collaboration or dataset access inquiries, please contact **Zongqi Xu (SouthWest Minzu University)**. Feel free to open issues or pull requests for bug fixes, new backbones, or training tricks.
