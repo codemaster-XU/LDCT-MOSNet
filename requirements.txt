@@ -1,0 +1,16 @@
+# Core deep learning stack
+torch==2.1.0
+torchvision==0.16.0
+# For CUDA 12.1 wheels, install from https://download.pytorch.org/whl/cu121
+
+# Array & image processing
+numpy>=1.23.0
+Pillow>=9.5.0
+opencv-python>=4.8.0
+GDAL>=3.4.0
+
+# Training, logging, and metrics
+tensorboard>=2.13.0
+tqdm>=4.65.0
+matplotlib>=3.7.0
+scipy>=1.10.0
